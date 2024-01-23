@@ -1,99 +1,108 @@
-// A division is an administrative district that is part of a larger division of a country.
-// Divisions may, if they want, have their own subdivisions (Please don't do this, I beg of you, it's a nightmare).
-// Divisions are assigned both a border representing their area, and a list of points representing the communities they administer.
-// Upon creation, divisions should check to see if all of their child communities are within their borders.
-// Divisions should verify that their borders are contiguous, and that they do not overlap with any other divisions that are not their parent or child.
+use async_recursion::async_recursion;
+use async_std::sync::{Arc, RwLock};
+use geo::{BooleanOps, Contains, MultiPolygon, Point, Polygon};
 
-use geo::{ BooleanOps, Contains };
+use crate::modules::game::government::UniqueGovernment;
+use crate::modules::game::role::RequiredRole;
+
+pub type UniqueDivision = Arc<RwLock<Division>>;
+pub type DivisionBoundaries = MultiPolygon<f64>;
 
 pub struct Division {
     pub id: u64,
     pub name: String,
-    pub parent: Option<Box<Division>>,
-    pub area: geo::MultiPolygon<f64>,
-    pub subdivisions: Vec<Box<Division>>,
+    pub parent: Option<UniqueDivision>,
+    pub owner: Option<UniqueGovernment>,
+    pub area: DivisionBoundaries,
+    pub subdivisions: Vec<UniqueDivision>,
+    pub required_positions: Vec<RequiredRole>,
 }
+
 impl Division {
-    pub fn new(id: u64, name: String, parent: Option<Box<Division>>, area: geo::MultiPolygon<f64>) -> Division {
-        Division {
+    pub fn new(id: u64, name: String, parent: Option<UniqueDivision>, owner: Option<UniqueGovernment>, area: DivisionBoundaries) -> Self {
+        Self {
             id,
             name,
             parent,
+            owner,
             area,
             subdivisions: Vec::new(),
+            required_positions: Vec::new(),
         }
     }
-    
-    // This method loops through all of it's subdivisions
-    // and their subdivisions, and so on, and returns creates a large multi-polygon representing
-    // the total area of the division and all of it's subdivisions
-    pub fn join_all(self) -> geo::MultiPolygon {
+
+    #[async_recursion]
+    pub async fn join_all(&self) -> MultiPolygon<f64> {
         let mut polygons = Vec::new();
-        polygons.extend(self.area.0.clone());
-        for subdivision in self.subdivisions {
-            polygons.extend(subdivision.join_all().0.clone()); // Recursivity! :D
+        let self_area = self.area.clone();
+        polygons.extend(self_area.into_iter());
+
+        for subdivision in &self.subdivisions {
+            let subdivision = subdivision.read().await;
+            polygons.extend(subdivision.join_all().await.into_iter());
         }
-        geo::MultiPolygon(polygons)
+
+        MultiPolygon(polygons)
     }
 
-    fn add_subdivision(&mut self, subdivision: Division) {
-        self.subdivisions.push(Box::new(subdivision));
+    pub async fn add_subdivision(&mut self, subdivision: UniqueDivision) {
+        subdivision.write().await.owner = self.owner.clone();
+        self.subdivisions.push(subdivision);
     }
 
-    fn in_division(&self, point: &geo::Point<f64>) -> bool {
-        // Check if the point is in the division's area
+    fn in_division(&self, point: &Point<f64>) -> bool {
         self.area.contains(point)
     }
 
-    fn in_division_poly(&self, polygon: &geo::Polygon<f64>) -> bool {
-        // Check if the polygon is in the division's area
+    fn in_division_poly(&self, polygon: &Polygon<f64>) -> bool {
         self.area.contains(polygon)
     }
 
-
-    // Function that takes a list of polygons, checks if they are all in the division, 
-    // and after sufficiently checking, returns a new multi-polygon representing the area of the division
-    fn create_area(&self, polys: &Vec<geo::Polygon<f64>>) -> Result<geo::MultiPolygon<f64>, ()> {
-        // Check if all of the points are in the division
-        for poly in polys {
-            if !self.in_division_poly(poly) {
-                return Err(());
-            }
+    fn create_area(&self, polys: &[Polygon<f64>]) -> Result<MultiPolygon<f64>, String> {
+        if polys.iter().any(|poly| !self.in_division_poly(poly)) {
+            return Err("Some polygons are not within the division's area".to_string());
         }
+        Ok(MultiPolygon(polys.to_vec()))
+    }
 
-        // Create a new multi-polygon from the points
-        let mut polygons = Vec::new();
-        for poly in polys {
-            polygons.push(poly.clone());
+    fn create_area_with_points(&self, points: &[Point<f64>]) -> Result<MultiPolygon<f64>, String> {
+        if points.iter().any(|point| !self.in_division(point)) {
+            return Err("Some points are not within the division's area".to_string());
         }
-        Ok(geo::MultiPolygon(polygons))
+        let polygon = Polygon::new(points.to_vec().into(), vec![]);
+        if !self.in_division_poly(&polygon) {
+            return Err("The created polygon is not within the division's area".to_string());
+        }
+        Ok(MultiPolygon(vec![polygon]))
     }
 
 
+    pub async fn create_subdivision(&mut self, name: String, polys: Vec<Polygon<f64>>) -> Result<(), String> {
+        let new_area = self.create_area(&polys)?;
+        let difference_area = self.area.difference(&new_area);
 
-    pub fn create_subdivision(&mut self, name: String, polys: Vec<geo::Polygon>) -> Result<(), ()> {
-        // Subtract the area of the subdivision from the area of the parent
-        // If the parent has no area left, return an error
-        // If the parent has area left, add the subdivision to the parent's list of subdivisions
-
-        // Create a new division
-        let mut subdivision = self.create_area(&polys)?;
-        subdivision = self.area.difference(&subdivision);
-        if subdivision.0.len() == 0 {
-            return Err(());
+        if difference_area.0.is_empty() {
+            return Err("No area left for the parent division after subdivision".to_string());
         }
-        let subdivision = Division::new(0, name, Some(Box::new(self.clone())), subdivision);
+
+        let subdivision = Division::new(0, name, Some(Arc::new(RwLock::new(self.clone()))), self.owner.clone(), new_area);
+        let subdivision = Arc::new(RwLock::new(subdivision));
+        self.add_subdivision(subdivision).await;
+
         Ok(())
     }
 }
+
 impl Clone for Division {
-    fn clone(&self) -> Division {
-        Division {
+    fn clone(&self) -> Self {
+        Self {
             id: self.id,
             name: self.name.clone(),
-            parent: self.parent.clone(),
+            parent: self.parent.as_ref().map(|parent| Arc::clone(parent)),
+            owner: self.owner.clone(),
             area: self.area.clone(),
-            subdivisions: self.subdivisions.clone(),
+            subdivisions: self.subdivisions.iter().map(|sd| Arc::clone(sd)).collect(),
+            required_positions: self.required_positions.clone(),
         }
     }
 }
